@@ -1,218 +1,230 @@
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
 const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
 const cors = require('cors');
 const qrcode = require('qrcode');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Pool } = require('pg');
 
 const app = express();
-app.use(cors({ origin: '*' }));
+app.use(cors());
 app.use(express.json());
 
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 
-// Store clients per companyId
-const waClients = {};
-const waStatus = {};
-const conversations = {};
+let currentQR = null;
+let connectionStatus = 'disconnected'; // disconnected | qr | connecting | connected
+let sock = null;
 
-function getOrCreateClient(companyId, socket) {
-  if (waClients[companyId]) return waClients[companyId];
-
-  const client = new Client({
-    authStrategy: new LocalAuth({ clientId: companyId }),
-    puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] }
-  });
-
-  waStatus[companyId] = 'loading';
-
-  client.on('qr', async (qr) => {
-    waStatus[companyId] = 'qr';
-    const qrDataUrl = await qrcode.toDataURL(qr);
-    io.to(companyId).emit('qr', qrDataUrl);
-  });
-
-  client.on('ready', () => {
-    waStatus[companyId] = 'ready';
-    io.to(companyId).emit('ready', { phone: client.info?.wid?.user });
-    console.log(`[${companyId}] WhatsApp ready`);
-  });
-
-  client.on('authenticated', () => {
-    waStatus[companyId] = 'authenticated';
-    io.to(companyId).emit('authenticated');
-  });
-
-  client.on('auth_failure', () => {
-    waStatus[companyId] = 'auth_failure';
-    io.to(companyId).emit('auth_failure');
-    delete waClients[companyId];
-  });
-
-  client.on('disconnected', () => {
-    waStatus[companyId] = 'disconnected';
-    io.to(companyId).emit('disconnected');
-    delete waClients[companyId];
-  });
-
-  client.on('message', async (msg) => {
-    if (msg.fromMe) return;
-    const contact = await msg.getContact();
-    const chat = await msg.getChat();
-    const message = {
-      id: msg.id.id,
-      from: msg.from,
-      name: contact.pushname || contact.number,
-      body: msg.body,
-      timestamp: msg.timestamp,
-      fromMe: false,
-      chatId: chat.id._serialized,
-    };
-    if (!conversations[companyId]) conversations[companyId] = {};
-    if (!conversations[companyId][chat.id._serialized]) {
-      conversations[companyId][chat.id._serialized] = {
-        id: chat.id._serialized,
-        name: contact.pushname || contact.number,
-        phone: contact.number,
-        messages: [],
-        lastMessage: '',
-        lastTime: 0,
-        unread: 0,
-      };
+// ===== FAQ Auto-Reply =====
+async function findFaqReply(companyId, messageText) {
+  try {
+    const { rows } = await pool.query(
+      'SELECT keyword, answer FROM "WhatsappFaq" WHERE "companyId" = $1 ORDER BY "createdAt" ASC',
+      [companyId]
+    );
+    const lowerText = (messageText || '').toLowerCase();
+    for (const row of rows) {
+      if (row.keyword && lowerText.includes(row.keyword.toLowerCase())) {
+        return row.answer;
+      }
     }
-    conversations[companyId][chat.id._serialized].messages.push(message);
-    conversations[companyId][chat.id._serialized].lastMessage = msg.body;
-    conversations[companyId][chat.id._serialized].lastTime = msg.timestamp;
-    conversations[companyId][chat.id._serialized].unread++;
-    io.to(companyId).emit('message', message);
-    io.to(companyId).emit('conversations', Object.values(conversations[companyId]));
-  });
-
-  client.initialize();
-  waClients[companyId] = client;
-  return client;
+    return null;
+  } catch (e) {
+    console.error('FAQ lookup error:', e);
+    return null;
+  }
 }
 
-// Socket.io
-io.on('connection', (socket) => {
-  console.log('Socket connected:', socket.id);
+// ===== Company sessions storage =====
+// companyId -> { sock, status, qr, autoReply, companyName }
+const sessions = {};
 
-  socket.on('join', (companyId) => {
-    socket.join(companyId);
-    socket.companyId = companyId;
-    console.log(`[${companyId}] joined`);
+async function startSession(companyId, companyName = 'الشركة', autoReply = true) {
+  if (sessions[companyId]?.status === 'connected') return;
 
-    // Send current status
-    const status = waStatus[companyId] || 'disconnected';
-    socket.emit('status', status);
+  const { state, saveCreds } = await useMultiFileAuthState(`./auth_${companyId}`);
 
-    if (status === 'ready') {
-      socket.emit('conversations', Object.values(conversations[companyId] || {}));
+  const socket = makeWASocket({
+    auth: state,
+    printQRInTerminal: false,
+    browser: ['Tijara CRM', 'Chrome', '1.0'],
+  });
+
+  sessions[companyId] = {
+    sock: socket,
+    status: 'connecting',
+    qr: null,
+    autoReply,
+    companyName,
+  };
+
+  socket.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      const qrDataUrl = await qrcode.toDataURL(qr);
+      sessions[companyId].qr = qrDataUrl;
+      sessions[companyId].status = 'qr';
+      console.log(`[${companyId}] QR ready`);
     }
-  });
 
-  socket.on('connect_whatsapp', (companyId) => {
-    getOrCreateClient(companyId, socket);
-    socket.emit('status', 'loading');
-  });
+    if (connection === 'close') {
+      const shouldReconnect = lastDisconnect?.error instanceof Boom
+        ? lastDisconnect.error.output?.statusCode !== DisconnectReason.loggedOut
+        : true;
 
-  socket.on('send_message', async ({ companyId, chatId, message }) => {
-    const client = waClients[companyId];
-    if (!client || waStatus[companyId] !== 'ready') return;
-    try {
-      await client.sendMessage(chatId, message);
-      const msg = {
-        id: Date.now().toString(),
-        from: 'me',
-        body: message,
-        timestamp: Math.floor(Date.now() / 1000),
-        fromMe: true,
-        chatId,
-      };
-      if (conversations[companyId] && conversations[companyId][chatId]) {
-        conversations[companyId][chatId].messages.push(msg);
-        conversations[companyId][chatId].lastMessage = message;
-        conversations[companyId][chatId].lastTime = msg.timestamp;
+      sessions[companyId].status = 'disconnected';
+      sessions[companyId].qr = null;
+
+      if (shouldReconnect) {
+        console.log(`[${companyId}] Reconnecting...`);
+        setTimeout(() => startSession(companyId, companyName, autoReply), 3000);
       }
-      io.to(companyId).emit('message_sent', msg);
-      io.to(companyId).emit('conversations', Object.values(conversations[companyId] || {}));
-    } catch (e) {
-      console.error('Send error:', e);
+    }
+
+    if (connection === 'open') {
+      sessions[companyId].status = 'connected';
+      sessions[companyId].qr = null;
+      console.log(`[${companyId}] Connected!`);
     }
   });
 
-  socket.on('get_conversations', async (companyId) => {
-    const client = waClients[companyId];
-    if (!client || waStatus[companyId] !== 'ready') return;
-    try {
-      const chats = await client.getChats();
-      const convs = [];
-      for (const chat of chats.slice(0, 30)) {
-        const messages = await chat.fetchMessages({ limit: 1 });
-        const last = messages[messages.length - 1];
-        convs.push({
-          id: chat.id._serialized,
-          name: chat.name,
-          phone: chat.id.user,
-          lastMessage: last?.body || '',
-          lastTime: last?.timestamp || 0,
-          unread: chat.unreadCount,
-          messages: [],
-        });
-      }
-      conversations[companyId] = {};
-      convs.forEach(c => conversations[companyId][c.id] = c);
-      socket.emit('conversations', convs);
-    } catch (e) {
-      console.error('Get chats error:', e);
-    }
-  });
+  socket.ev.on('creds.update', saveCreds);
 
-  socket.on('get_messages', async ({ companyId, chatId }) => {
-    const client = waClients[companyId];
-    if (!client || waStatus[companyId] !== 'ready') return;
-    try {
-      const chat = await client.getChatById(chatId);
-      const msgs = await chat.fetchMessages({ limit: 50 });
-      const messages = msgs.map(m => ({
-        id: m.id.id,
-        body: m.body,
-        fromMe: m.fromMe,
-        timestamp: m.timestamp,
-        chatId,
-      }));
-      if (conversations[companyId] && conversations[companyId][chatId]) {
-        conversations[companyId][chatId].messages = messages;
-        conversations[companyId][chatId].unread = 0;
-      }
-      socket.emit('messages', { chatId, messages });
-      // Mark as read
-      await chat.sendSeen();
-    } catch (e) {
-      console.error('Get messages error:', e);
-    }
-  });
+  socket.ev.on('messages.upsert', async ({ messages }) => {
+    const msg = messages[0];
+    if (!msg || msg.key.fromMe) return;
 
-  socket.on('logout_whatsapp', async (companyId) => {
-    const client = waClients[companyId];
-    if (client) {
-      await client.logout();
-      delete waClients[companyId];
-      delete conversations[companyId];
-    }
-    waStatus[companyId] = 'disconnected';
-    io.to(companyId).emit('status', 'disconnected');
+    const text = msg.message?.conversation
+      || msg.message?.extendedTextMessage?.text
+      || '';
+
+    if (!text || !sessions[companyId]?.autoReply) return;
+
+    const jid = msg.key.remoteJid;
+    console.log(`[${companyId}] Message from ${jid}: ${text}`);
+
+    const reply = await findFaqReply(companyId, text);
+    if (!reply) return;
+
+    await socket.sendMessage(jid, { text: reply });
+    console.log(`[${companyId}] Auto-replied: ${reply}`);
+  });
+}
+
+// ===== API Routes =====
+
+// Connect / get QR
+app.post('/api/connect', async (req, res) => {
+  const { companyId, companyName, autoReply } = req.body;
+  if (!companyId) return res.status(400).json({ error: 'companyId required' });
+
+  await startSession(companyId, companyName || 'الشركة', autoReply !== false);
+  res.json({ status: sessions[companyId]?.status || 'connecting' });
+});
+
+// Get QR code
+app.get('/api/qr/:companyId', (req, res) => {
+  const { companyId } = req.params;
+  const session = sessions[companyId];
+
+  if (!session) return res.json({ status: 'not_started', qr: null });
+
+  res.json({
+    status: session.status,
+    qr: session.qr,
   });
 });
 
-// REST API
-app.get('/health', (req, res) => res.json({ ok: true }));
-app.get('/status/:companyId', (req, res) => {
-  res.json({ status: waStatus[req.params.companyId] || 'disconnected' });
+// Disconnect
+app.post('/api/disconnect', async (req, res) => {
+  const { companyId } = req.body;
+  const session = sessions[companyId];
+
+  if (session?.sock) {
+    await session.sock.logout();
+    delete sessions[companyId];
+  }
+
+  res.json({ success: true });
 });
+
+// Send message manually
+app.post('/api/send', async (req, res) => {
+  const { companyId, phone, message } = req.body;
+  const session = sessions[companyId];
+
+  if (!session || session.status !== 'connected') {
+    return res.status(400).json({ error: 'Not connected' });
+  }
+
+  const jid = phone.replace(/[^0-9]/g, '') + '@s.whatsapp.net';
+  await session.sock.sendMessage(jid, { text: message });
+  res.json({ success: true });
+});
+
+// Toggle auto-reply
+app.post('/api/toggle-reply', (req, res) => {
+  const { companyId, autoReply } = req.body;
+  if (sessions[companyId]) {
+    sessions[companyId].autoReply = autoReply;
+  }
+  res.json({ success: true });
+});
+
+// QR Page — HTML page to scan
+app.get('/qr-page/:companyId', (req, res) => {
+  const { companyId } = req.params;
+  const session = sessions[companyId];
+
+  if (!session) {
+    startSession(companyId, 'tijara', true);
+    return res.send(`<html><head><meta http-equiv="refresh" content="3"></head><body style="font-family:sans-serif;text-align:center;margin-top:100px"><h2>جاري بدء الاتصال...</h2><p>الصفحة ستتحدث تلقائياً</p></body></html>`);
+  }
+
+  if (session.status === 'connected') {
+    return res.send('<h2 style="color:green;font-family:sans-serif;text-align:center;margin-top:100px">✅ WhatsApp متصل!</h2>');
+  }
+
+  if (!session.qr) {
+    return res.send(`
+      <html><head><meta http-equiv="refresh" content="2"></head>
+      <body style="font-family:sans-serif;text-align:center;margin-top:100px">
+        <h2>جاري توليد QR Code...</h2>
+        <p>الصفحة ستتحدث تلقائياً</p>
+      </body></html>
+    `);
+  }
+
+  res.send(`
+    <html>
+    <head>
+      <meta http-equiv="refresh" content="30">
+      <style>
+        body { font-family: sans-serif; text-align: center; background: #f0f0f0; padding: 40px; }
+        .card { background: white; border-radius: 16px; padding: 32px; display: inline-block; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }
+        h2 { color: #25D366; }
+        p { color: #666; }
+        img { border: 4px solid #25D366; border-radius: 8px; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h2>📱 WhatsApp CRM — Tijara</h2>
+        <p>افتح WhatsApp → النقاط الثلاث → الأجهزة المرتبطة → ربط جهاز</p>
+        <img src="${session.qr}" width="300" height="300">
+        <p style="font-size:12px;color:#999">QR Code يتجدد كل 30 ثانية</p>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
+// Health check (keep alive)
+app.get('/health', (req, res) => res.json({ status: 'ok', sessions: Object.keys(sessions).length }));
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`Tijara WhatsApp Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`WhatsApp server running on port ${PORT}`));
