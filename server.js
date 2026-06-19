@@ -22,7 +22,7 @@ let sock = null;
 async function findFaqReply(companyId, messageText) {
   try {
     const { rows } = await pool.query(
-      'SELECT keyword, answer FROM "WhatsappFaq" WHERE "companyId" = $1 ORDER BY "createdAt" ASC',
+      'SELECT keyword, answer FROM "WhatsappFaq" WHERE "accountId" = $1 ORDER BY "createdAt" ASC',
       [companyId]
     );
     const lowerText = (messageText || '').toLowerCase();
