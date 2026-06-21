@@ -94,24 +94,31 @@ async function startSession(companyId, companyName = 'الشركة', autoReply =
 
   socket.ev.on('creds.update', saveCreds);
 
-  socket.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg || msg.key.fromMe) return;
+  socket.ev.on('messages.upsert', ({ messages }) => {
+    for (const msg of messages) {
+      if (!msg || msg.key.fromMe) continue;
 
-    const text = msg.message?.conversation
-      || msg.message?.extendedTextMessage?.text
-      || '';
+      const text = msg.message?.conversation
+        || msg.message?.extendedTextMessage?.text
+        || '';
 
-    if (!text || !sessions[companyId]?.autoReply) return;
+      if (!text || !sessions[companyId]?.autoReply) continue;
 
-    const jid = msg.key.remoteJid;
-    console.log(`[${companyId}] Message from ${jid}: ${text}`);
+      const jid = msg.key.remoteJid;
 
-    const reply = await findFaqReply(companyId, text);
-    if (!reply) return;
-
-    await socket.sendMessage(jid, { text: reply });
-    console.log(`[${companyId}] Auto-replied: ${reply}`);
+      (async () => {
+        try {
+          console.log(`[${companyId}] Message from ${jid}: ${text}`);
+          const reply = await findFaqReply(companyId, text);
+          if (reply) {
+            await socket.sendMessage(jid, { text: reply });
+            console.log(`[${companyId}] Replied to ${jid}: ${reply}`);
+          }
+        } catch (err) {
+          console.error(`[${companyId}] Error:`, err.message);
+        }
+      })();
+    }
   });
 }
 
