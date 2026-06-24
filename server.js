@@ -234,4 +234,16 @@ app.get('/qr-page/:companyId', (req, res) => {
 app.get('/health', (req, res) => res.json({ status: 'ok', sessions: Object.keys(sessions).length }));
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`WhatsApp server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`WhatsApp server running on port ${PORT}`);
+});
+
+
+// ===== Keep-Alive: prevent Render from sleeping =====
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+setInterval(() => {
+  fetch(`${RENDER_URL}/health`)
+    .then(() => console.log('[Keep-Alive] ping OK'))
+    .catch(() => console.log('[Keep-Alive] ping failed'));
+}, 5 * 60 * 1000); // every 5 minutes
+
